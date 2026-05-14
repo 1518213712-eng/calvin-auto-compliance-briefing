@@ -1,0 +1,28 @@
+{
+  "name": "auto-data-compliance-monthly-newsletter-workbench",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "dayjs": "^1.11.13",
+    "docxtemplater": "^3.60.0",
+    "file-saver": "^2.0.5",
+    "pizzip": "^3.2.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  }
+}
