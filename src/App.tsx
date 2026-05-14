@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import dayjs from 'dayjs';
 import customParseFormat from 'dayjs/plugin/customParseFormat';
-import { z } from 'zod';
 import { saveAs } from 'file-saver';
 import PizZip from 'pizzip';
 import Docxtemplater from 'docxtemplater';
@@ -16,9 +15,9 @@ type SupplementRegion = Region | 'both';
 type SourceEntry = { id: string; type: SourceType; name: string; url: string };
 type NewsItem = { id: string; region: Region; date: string; title: string; summary: string; source_name: string; url: string };
 type RenderItem = NewsItem & { link_token: string; display_summary: string };
-type ParsedItem = Omit<NewsItem, 'id' | 'source_name'> & { source_name?: string };
-type ParsedPayload = { issue_month: string; date_range: { start: string; end: string }; items: ParsedItem[] };
 type DraftState = { month: string; items: NewsItem[]; step: WizardStep; reviewRegion: Region };
+type ParseResult = { items: NewsItem[]; message: string };
+type LooseRecord = Record<string, unknown>;
 
 const DEFAULT_SOURCES: SourceEntry[] = [
   { id: 'wechat-caam', type: 'wechat', name: '中国汽车工业协会', url: '' },
@@ -50,22 +49,6 @@ const STEPS: { key: WizardStep; label: string }[] = [
   { key: 'review', label: '审核导出' },
 ];
 
-const ITEM_SCHEMA = z.object({
-  region: z.enum(['domestic', 'overseas']),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  title: z.string().min(1),
-  summary: z.string().min(1),
-  source_name: z.string().optional(),
-  url: z.preprocess((value) => typeof value === 'string' ? normalizeUrlInput(value) : value, z.string().url()),
-});
-const PAYLOAD_SCHEMA = z.object({
-  issue_month: z.string().regex(/^\d{4}-\d{2}$/),
-  date_range: z.object({
-    start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-    end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  }),
-  items: z.array(ITEM_SCHEMA),
-});
 const DEFAULT_MONTH = dayjs().format('YYYY-MM');
 
 function monthRange(month: string) {
@@ -139,16 +122,20 @@ function inferSourceName(url: string, sources: SourceEntry[]) {
   }
 }
 function normalizeUrlInput(value: string) {
-  let url = value.trim().replace(/^<|>$/g, '');
+  let url = String(value).trim().replace(/^<|>$/g, '').replace(/[，。；;、\s]+$/g, '');
   const markdownMatch = url.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
   if (markdownMatch) {
     const label = markdownMatch[1].trim();
     const target = markdownMatch[2].trim();
     url = /^https?:\/\//i.test(label) ? label : target;
   }
+  const embeddedUrl = url.match(/https?:\/\/[^\s\])）>，。；;]+/i);
+  if (embeddedUrl && !/^https?:\/\//i.test(url)) url = embeddedUrl[0];
+  if (/^www\./i.test(url)) url = `https://${url}`;
   try {
     const parsed = new URL(url);
-    if (parsed.hostname.replace(/^www\./, '') === 'google.com' && parsed.pathname === '/search') {
+    const hostname = parsed.hostname.replace(/^www\./, '');
+    if ((hostname === 'google.com' || hostname === 'bing.com') && parsed.pathname === '/search') {
       const queryUrl = parsed.searchParams.get('q');
       if (queryUrl && /^https?:\/\//i.test(queryUrl)) return queryUrl;
     }
@@ -158,17 +145,113 @@ function normalizeUrlInput(value: string) {
   return url;
 }
 function extractJsonInput(value: string) {
-  const trimmed = value.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  if (fenced) return fenced[1].trim();
+  let trimmed = value.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced) trimmed = fenced[1].trim();
   const start = trimmed.indexOf('{');
   const end = trimmed.lastIndexOf('}');
   if (start >= 0 && end > start) return trimmed.slice(start, end + 1);
+  const arrayStart = trimmed.indexOf('[');
+  const arrayEnd = trimmed.lastIndexOf(']');
+  if (arrayStart >= 0 && arrayEnd > arrayStart) return trimmed.slice(arrayStart, arrayEnd + 1);
+  const itemsMatch = trimmed.match(/items\s*:\s*(\[[\s\S]*\])/i);
+  if (itemsMatch) return `{"items":${itemsMatch[1]}}`;
   return trimmed;
 }
-function normalizeParsedItem(item: ParsedItem, sources: SourceEntry[]): Omit<NewsItem, 'id'> {
-  const url = normalizeUrlInput(item.url);
-  return { ...item, url, source_name: item.source_name?.trim() || inferSourceName(url, sources) };
+function parseJsonLoose(value: string) {
+  const extracted = extractJsonInput(value);
+  const candidates = [
+    extracted,
+    extracted.replace(/,\s*([}\]])/g, '$1'),
+    extracted.replace(/([{,]\s*)([A-Za-z_][\w-]*)\s*:/g, '$1"$2":').replace(/,\s*([}\]])/g, '$1'),
+  ];
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('JSON 解析失败。');
+}
+function asRecord(value: unknown): LooseRecord {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as LooseRecord : {};
+}
+function pickString(record: LooseRecord, keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' || typeof value === 'number') {
+      const text = String(value).trim();
+      if (text) return text;
+    }
+  }
+  return '';
+}
+function pickItems(payload: unknown) {
+  if (Array.isArray(payload)) return payload;
+  const record = asRecord(payload);
+  const keys = ['items', 'news', 'list', 'data', '新闻', '新闻列表', '条目'];
+  for (const key of keys) {
+    if (Array.isArray(record[key])) return record[key] as unknown[];
+  }
+  return [];
+}
+function normalizeRegionInput(value: string): Region | null {
+  const text = value.trim().toLowerCase();
+  if (['domestic', '境内', '国内', '中国', '内地'].includes(text)) return 'domestic';
+  if (['overseas', 'foreign', 'global', '境外', '域外', '海外', '国际', '国外'].includes(text)) return 'overseas';
+  if (/境内|国内|中国/.test(value)) return 'domestic';
+  if (/境外|域外|海外|国际|国外/.test(value)) return 'overseas';
+  return null;
+}
+function normalizeDateInput(value: string, month: string) {
+  const text = value.trim();
+  const year = month.slice(0, 4);
+  const candidates = [
+    text,
+    text.replace(/[/.]/g, '-'),
+    text.replace(/年|月/g, '-').replace(/日/g, ''),
+  ];
+  const md = text.match(/^(\d{1,2})\s*[月/.-]\s*(\d{1,2})\s*日?$/);
+  if (md) candidates.push(`${year}-${md[1].padStart(2, '0')}-${md[2].padStart(2, '0')}`);
+  for (const candidate of candidates) {
+    const parsed = dayjs(candidate, ['YYYY-MM-DD', 'YYYY-M-D'], true);
+    if (parsed.isValid() && parsed.format('YYYY-MM') === month) return parsed.format('YYYY-MM-DD');
+  }
+  return '';
+}
+function parsePayloadMonth(payload: unknown) {
+  const record = asRecord(payload);
+  return pickString(record, ['issue_month', 'month', '月份', '期数月份', '发布月份']);
+}
+function coerceNewsItem(value: unknown, month: string, sources: SourceEntry[]): Omit<NewsItem, 'id'> | null {
+  const record = asRecord(value);
+  const region = normalizeRegionInput(pickString(record, ['region', '地域', '区域', '地区', '类型']));
+  const date = normalizeDateInput(pickString(record, ['date', '日期', '发布时间', '发布日期', 'publish_date']), month);
+  const title = pickString(record, ['title', '标题', '新闻标题', '题目']);
+  const summary = pickString(record, ['summary', '摘要', '内容', '正文', '简述', '新闻摘要']);
+  const url = normalizeUrlInput(pickString(record, ['url', 'link', '链接', '原文链接', '网址', 'source_url']));
+  const sourceName = pickString(record, ['source_name', 'source', '来源', '来源名称', '发布机构', '媒体']);
+  if (!region || !date || !title || !summary || !/^https?:\/\//i.test(url)) return null;
+  return { region, date, title, summary, source_name: sourceName || inferSourceName(url, sources), url };
+}
+function parseGeminiPayload(json: string, month: string, sources: SourceEntry[]): ParseResult {
+  const raw = parseJsonLoose(json);
+  const payloadMonth = parsePayloadMonth(raw);
+  if (payloadMonth && payloadMonth !== month) throw new Error(`JSON 月份与当前选择不一致：${payloadMonth} ≠ ${month}`);
+  const rawItems = pickItems(raw);
+  const normalized = rawItems.map((item) => coerceNewsItem(item, month, sources)).filter((item): item is Omit<NewsItem, 'id'> => Boolean(item));
+  if (!normalized.length) throw new Error('没有解析到可用条目。请确认至少包含地域、日期、标题、摘要和原文链接。');
+  const skipped = rawItems.length - normalized.length;
+  const markdownCleaned = rawItems.filter((item) => {
+    const url = pickString(asRecord(item), ['url', 'link', '链接', '原文链接', '网址', 'source_url']);
+    return /^\[.+\]\(.+\)$/.test(url) || /google\.com\/search|bing\.com\/search/i.test(url);
+  }).length;
+  const parts = [`已解析 ${normalized.length} 条`];
+  if (markdownCleaned) parts.push(`自动清洗 ${markdownCleaned} 个链接`);
+  if (skipped) parts.push(`跳过 ${skipped} 条不完整数据`);
+  return { items: sortItemsByDate(normalized.map((item) => createItem(item))), message: `${parts.join('，')}。` };
 }
 function createItem(partial?: Partial<NewsItem>): NewsItem {
   return { id: randomId(), region: partial?.region ?? 'domestic', date: partial?.date ?? `${DEFAULT_MONTH}-01`, title: partial?.title ?? '', summary: partial?.summary ?? '', source_name: partial?.source_name ?? '', url: partial?.url ?? '' };
@@ -373,32 +456,32 @@ export default function App() {
     setEditingId((current) => (current === id ? null : current));
   };
   const parseJson = (json: string) => {
-    const parsed = PAYLOAD_SCHEMA.parse(JSON.parse(extractJsonInput(json))) as ParsedPayload;
-    if (parsed.issue_month !== month) throw new Error(`JSON 月份与当前选择不一致：${parsed.issue_month} ≠ ${month}`);
-    return sortItemsByDate(parsed.items.map((item) => createItem(normalizeParsedItem(item, sources))));
+    return parseGeminiPayload(json, month, sources);
   };
   const handleInitialParse = () => {
     try {
-      const normalized = parseJson(initialJson);
+      const result = parseJson(initialJson);
+      const normalized = result.items;
       setItems(normalized);
       setInitialJson('');
       const nextStep = isComplete(normalized) ? 'review' : 'supplement';
       setStep(nextStep);
       setSupplementRegion(countByRegion(normalized, 'domestic') < 10 && countByRegion(normalized, 'overseas') < 10 ? 'both' : countByRegion(normalized, 'domestic') < 10 ? 'domestic' : 'overseas');
-      setNotice(`第一轮解析成功：境内 ${countByRegion(normalized, 'domestic')} 条，域外 ${countByRegion(normalized, 'overseas')} 条。`);
+      setNotice(`${result.message} 境内 ${countByRegion(normalized, 'domestic')} 条，域外 ${countByRegion(normalized, 'overseas')} 条。`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'JSON 解析失败。');
     }
   };
   const handleSupplementAppend = () => {
     try {
-      const incoming = parseJson(supplementJson).filter((item) => supplementRegion === 'both' || item.region === supplementRegion);
+      const result = parseJson(supplementJson);
+      const incoming = result.items.filter((item) => supplementRegion === 'both' || item.region === supplementRegion);
       setItems((current) => {
         const seenUrls = new Set(current.map((item) => item.url.trim()).filter(Boolean));
         const seenTitles = new Set(current.map((item) => item.title.trim()).filter(Boolean));
         const merged = sortItemsByDate([...current, ...incoming.filter((item) => !seenUrls.has(item.url.trim()) && !seenTitles.has(item.title.trim()))]);
         if (isComplete(merged)) setStep('review');
-        setNotice(`追加成功：境内 ${countByRegion(merged, 'domestic')} 条，域外 ${countByRegion(merged, 'overseas')} 条。`);
+        setNotice(`${result.message} 追加后境内 ${countByRegion(merged, 'domestic')} 条，域外 ${countByRegion(merged, 'overseas')} 条。`);
         return merged;
       });
       setSupplementJson('');
