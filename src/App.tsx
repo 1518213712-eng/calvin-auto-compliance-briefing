@@ -56,7 +56,7 @@ const ITEM_SCHEMA = z.object({
   title: z.string().min(1),
   summary: z.string().min(1),
   source_name: z.string().optional(),
-  url: z.string().url(),
+  url: z.preprocess((value) => typeof value === 'string' ? normalizeUrlInput(value) : value, z.string().url()),
 });
 const PAYLOAD_SCHEMA = z.object({
   issue_month: z.string().regex(/^\d{4}-\d{2}$/),
@@ -113,7 +113,7 @@ function sourceNames(sources: SourceEntry[], type: SourceType) {
 }
 function inferSourceName(url: string, sources: SourceEntry[]) {
   try {
-    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    const hostname = new URL(normalizeUrlInput(url)).hostname.replace(/^www\./, '');
     const matched = cleanSources(sources).find((source) => source.url && source.url.includes(hostname));
     if (matched) return matched.name;
     const domainMap: Record<string, string> = {
@@ -138,8 +138,37 @@ function inferSourceName(url: string, sources: SourceEntry[]) {
     return '待补充来源';
   }
 }
+function normalizeUrlInput(value: string) {
+  let url = value.trim().replace(/^<|>$/g, '');
+  const markdownMatch = url.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+  if (markdownMatch) {
+    const label = markdownMatch[1].trim();
+    const target = markdownMatch[2].trim();
+    url = /^https?:\/\//i.test(label) ? label : target;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.replace(/^www\./, '') === 'google.com' && parsed.pathname === '/search') {
+      const queryUrl = parsed.searchParams.get('q');
+      if (queryUrl && /^https?:\/\//i.test(queryUrl)) return queryUrl;
+    }
+  } catch {
+    return url;
+  }
+  return url;
+}
+function extractJsonInput(value: string) {
+  const trimmed = value.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) return fenced[1].trim();
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start >= 0 && end > start) return trimmed.slice(start, end + 1);
+  return trimmed;
+}
 function normalizeParsedItem(item: ParsedItem, sources: SourceEntry[]): Omit<NewsItem, 'id'> {
-  return { ...item, source_name: item.source_name?.trim() || inferSourceName(item.url, sources) };
+  const url = normalizeUrlInput(item.url);
+  return { ...item, url, source_name: item.source_name?.trim() || inferSourceName(url, sources) };
 }
 function createItem(partial?: Partial<NewsItem>): NewsItem {
   return { id: randomId(), region: partial?.region ?? 'domestic', date: partial?.date ?? `${DEFAULT_MONTH}-01`, title: partial?.title ?? '', summary: partial?.summary ?? '', source_name: partial?.source_name ?? '', url: partial?.url ?? '' };
@@ -193,7 +222,7 @@ function buildPrompt(month: string, sources: SourceEntry[]) {
     '- title：建议 8-16 个中文字符。',
     '- summary：150-250 字，必须以日期开头，例如 “4月16日，……”。',
     '- source_name：发布机构或媒体名称。',
-    '- url：具体原文链接。',
+    '- url：具体原文链接。必须只输出裸 URL 字符串，不要 Markdown 链接格式，不要 Google/Bing 搜索结果链接。',
     '',
     '输出顺序：先输出 5 条 domestic，再输出 5 条 overseas；每个区域内部按日期从早到晚排序。',
     '',
@@ -232,7 +261,7 @@ function buildSupplementPrompt(month: string, items: NewsItem[], sources: Source
     '- title：建议 8-16 个中文字符。',
     '- summary：150-250 字，必须以日期开头，例如 “4月16日，……”。',
     '- source_name：发布机构或媒体名称。',
-    '- url：具体原文链接。',
+    '- url：具体原文链接。必须只输出裸 URL 字符串，不要 Markdown 链接格式，不要 Google/Bing 搜索结果链接。',
     '',
     ...sourcePromptBlock(sources),
   ].join('\n');
@@ -344,7 +373,7 @@ export default function App() {
     setEditingId((current) => (current === id ? null : current));
   };
   const parseJson = (json: string) => {
-    const parsed = PAYLOAD_SCHEMA.parse(JSON.parse(json)) as ParsedPayload;
+    const parsed = PAYLOAD_SCHEMA.parse(JSON.parse(extractJsonInput(json))) as ParsedPayload;
     if (parsed.issue_month !== month) throw new Error(`JSON 月份与当前选择不一致：${parsed.issue_month} ≠ ${month}`);
     return sortItemsByDate(parsed.items.map((item) => createItem(normalizeParsedItem(item, sources))));
   };
