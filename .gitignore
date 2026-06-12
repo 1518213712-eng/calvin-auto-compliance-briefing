@@ -3,6 +3,8 @@ dist
 tsconfig.tsbuildinfo
 .npm-cache
 .DS_Store
+._*
+**/._*
 tmp_docx_tpl
 test-export*.docx
 《车企快讯（2026.04.01-2026.04.31）》(4).docx
