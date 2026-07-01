@@ -425,7 +425,7 @@ function escapeXmlAttr(value: string) { return escapeXml(value); }
 function makeLinkToken(index: number) { return `__LINK_${index + 1}__`; }
 function displaySummary(item: NewsItem) {
   const summary = item.summary.trim();
-  if (/^\d{1,2}月\d{1,2}日，/.test(summary)) return summary;
+  if (/^\d{1,2}月\d{1,2}日[，,]\s*/.test(summary)) return summary;
   const date = dayjs(item.date, 'YYYY-MM-DD', true);
   if (!date.isValid()) return summary;
   return `${date.month() + 1}月${date.date()}日，${summary}`;
